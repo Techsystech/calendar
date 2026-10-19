@@ -4,10 +4,12 @@
 
 from datetime import datetime
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 from freezegun import freeze_time
 from lxml.html import fromstring
 
+from odoo.exceptions import ValidationError
 from odoo.tests import new_test_user, tagged
 from odoo.tests.common import HttpCase
 
@@ -35,7 +37,7 @@ class PortalCase(HttpCase):
             cls.env,
             login="mgr",
             password="mgr",
-            groups="resource_booking.group_manager",
+            groups="base.group_user,resource_booking.group_manager",
         )
 
     def _url_xml(self, url, data=None, timeout=10):
@@ -108,6 +110,115 @@ class PortalCase(HttpCase):
         self.assertTrue(booking.access_token)
         self.assertIn("access_token=", portal_url)
 
+    def test_portal_manager_invalid_slots_leave_original_unchanged(self):
+        self.rbt.write({"min_advance_booking_hours": 72, "max_advance_booking_days": 4})
+        booking = self.env["resource.booking"].create(
+            {
+                "type_id": self.rbt.id,
+                "partner_ids": [(4, self.partner.id)],
+                "start": "2021-03-01 10:00:00",
+                "combination_id": self.rbcs[0].id,
+                "combination_auto_assign": False,
+            }
+        )
+        url = booking.get_portal_url(suffix="/confirm")
+        original = (
+            booking.start,
+            booking.stop,
+            booking.combination_id,
+            booking.meeting_id,
+            booking.state,
+        )
+        self.authenticate("mgr", "mgr")
+        for when in (
+            "invalid",
+            "2021-03-01T10:00:00",
+            "2021-03-01T10:15:00Z",
+            "2021-03-01T08:00:00Z",
+            "2021-03-02T10:00:00Z",
+        ):
+            with self.subTest(when=when):
+                response = self.url_open(url + "&" + urlencode({"when": when}))
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("error=", response.url)
+                booking.invalidate_recordset()
+                self.assertEqual(
+                    (
+                        booking.start,
+                        booking.stop,
+                        booking.combination_id,
+                        booking.meeting_id,
+                        booking.state,
+                    ),
+                    original,
+                )
+        response = self.url_open(
+            url + "&" + urlencode({"when": "2021-03-01T11:00:00Z"})
+        )
+        self.assertEqual(response.status_code, 200)
+        booking.invalidate_recordset()
+        self.assertEqual(booking.start, datetime(2021, 3, 1, 11))
+        self.assertEqual(booking.state, "confirmed")
+
+    def test_portal_confirmation_rolls_back_assignment_and_attendance(self):
+        booking = self.env["resource.booking"].create(
+            {
+                "type_id": self.rbt.id,
+                "partner_ids": [(4, self.partner.id)],
+                "start": "2021-03-01 10:00:00",
+                "combination_id": self.rbcs[0].id,
+                "combination_auto_assign": False,
+            }
+        )
+        url = booking.get_portal_url(suffix="/confirm")
+        confirm = type(booking).action_confirm
+
+        def failing_confirm(records):
+            confirm(records)
+            raise ValidationError("Confirmation failed")
+
+        with patch.object(type(booking), "action_confirm", failing_confirm):
+            response = self.url_open(
+                url + "&" + urlencode({"when": "2021-03-01T11:00:00Z"})
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("error=", response.url)
+        booking.invalidate_recordset()
+        booking.meeting_id.invalidate_recordset()
+        booking.meeting_id.attendee_ids.invalidate_recordset()
+        self.assertEqual(booking.start, datetime(2021, 3, 1, 10))
+        self.assertEqual(booking.meeting_id.start, booking.start)
+        self.assertEqual(booking.combination_id, self.rbcs[0])
+        self.assertEqual(booking.state, "scheduled")
+        requester = booking.meeting_id.attendee_ids.filtered(
+            lambda attendee: attendee.partner_id == self.partner
+        )
+        self.assertEqual(requester.state, "needsAction")
+
+    def test_portal_cannot_move_frozen_booking_into_future(self):
+        self.rbt.resource_calendar_id = self.r_calendars[3]
+        booking = self.env["resource.booking"].create(
+            {
+                "type_id": self.rbt.id,
+                "partner_ids": [(4, self.partner.id)],
+                "start": "2021-02-26 12:00:00",
+                "combination_id": self.rbcs[3].id,
+                "combination_auto_assign": False,
+            }
+        )
+        response = self.url_open(
+            booking.get_portal_url(suffix="/confirm")
+            + "&"
+            + urlencode({"when": "2021-03-05T12:00:00Z"})
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("error=", response.url)
+        booking.invalidate_recordset()
+        booking.meeting_id.invalidate_recordset()
+        self.assertEqual(booking.start, datetime(2021, 2, 26, 12))
+        self.assertEqual(booking.meeting_id.start, booking.start)
+        self.assertEqual(booking.state, "scheduled")
+
     def test_portal_scheduling_conflict(self):
         """Produce a scheduling conflict and see how UI behaves.
 
@@ -138,16 +249,21 @@ class PortalCase(HttpCase):
         portal_url, public_url = (one.get_portal_url() for one in bookings)
         # Portal guy goes to scheduling page
         portal_page = self._url_xml(portal_url)
-        self.assertTrue(portal_page.cssselect('.badge:contains("Pending")'))
+        self.assertTrue(portal_page.cssselect('.o_rb_status_pill:contains("Pending")'))
         self.assertTrue(
-            portal_page.cssselect(':contains("Duration:") + :contains("01:00")')
-        )
-        self.assertTrue(
-            portal_page.cssselect(':contains("Location:") + :contains("Main office")')
+            portal_page.cssselect(
+                '.o_rb_detail_row:contains("Duration"):contains("1 hr")'
+            )
         )
         self.assertTrue(
             portal_page.cssselect(
-                ':contains("Meeting URL:") + :contains("Videocall Main office")'
+                '.o_rb_detail_row:contains("Location"):contains("Main office")'
+            )
+        )
+        self.assertTrue(
+            portal_page.cssselect(
+                '.o_rb_detail_row:contains("Meeting link")'
+                ':contains("Videocall Main office")'
             )
         )
         link = portal_page.cssselect('a:contains("Schedule")')[0]
@@ -177,17 +293,22 @@ class PortalCase(HttpCase):
         # Public guy does the same
         public_page = self._url_xml(public_url)
         self.assertTrue(
-            public_page.cssselect(':contains("Duration:") + :contains("00:30")')
-        )
-        self.assertTrue(
-            public_page.cssselect(':contains("Location:") + :contains("Office 2")')
+            public_page.cssselect(
+                '.o_rb_detail_row:contains("Duration"):contains("30 min")'
+            )
         )
         self.assertTrue(
             public_page.cssselect(
-                ':contains("Meeting URL:") + :contains("Videocall Office 2")'
+                '.o_rb_detail_row:contains("Location"):contains("Office 2")'
             )
         )
-        self.assertTrue(public_page.cssselect('.badge:contains("Pending")'))
+        self.assertTrue(
+            public_page.cssselect(
+                '.o_rb_detail_row:contains("Meeting link")'
+                ':contains("Videocall Office 2")'
+            )
+        )
+        self.assertTrue(public_page.cssselect('.o_rb_status_pill:contains("Pending")'))
         link = public_page.cssselect('a:contains("Schedule")')[0]
         public_url = link.get("href")
         public_page = self._url_xml(public_url)
@@ -231,22 +352,26 @@ class PortalCase(HttpCase):
         }
         public_page = self._url_xml(public_url, data)
         # Public guy's reservation succeeded
-        self.assertTrue(public_page.cssselect('.badge:contains("Confirmed")'))
+        self.assertTrue(
+            public_page.cssselect('.o_rb_status_pill:contains("Confirmed")')
+        )
         self.assertTrue(
             public_page.cssselect(
-                'div:contains("Booked resources:")'
+                '.o_rb_detail_row:contains("Booked resources")'
                 ':contains("Material resource for Mon")'
                 ':contains("User User 0")'
             )
         )
         self.assertTrue(
-            public_page.cssselect('div:contains("Location:"):contains("Office 2")')
-        )
-        self.assertTrue(
             public_page.cssselect(
-                'div:contains("Dates:")'
-                ':contains("03/01/2021 at (10:00:00 AM To 10:30:00 AM) (UTC)")'
+                '.o_rb_detail_row:contains("Location"):contains("Office 2")'
             )
+        )
+        self.assertIn(
+            booking_public.with_context(tz="UTC")._get_portal_start_display(),
+            public_page.cssselect('.o_rb_detail_row:contains("Date and time")')[
+                0
+            ].text_content(),
         )
         # Public guy's booking and related meeting are OK in backend
         booking_public.invalidate_model()
@@ -297,22 +422,26 @@ class PortalCase(HttpCase):
         }
         portal_page = self._url_xml(portal_url, data)
         # Portal guy's reservation succeeded
-        self.assertTrue(portal_page.cssselect('.badge:contains("Confirmed")'))
+        self.assertTrue(
+            portal_page.cssselect('.o_rb_status_pill:contains("Confirmed")')
+        )
         self.assertTrue(
             portal_page.cssselect(
-                'div:contains("Booked resources:")'
+                '.o_rb_detail_row:contains("Booked resources")'
                 ':contains("Material resource for Mon")'
                 ':contains("User User 0")'
             )
         )
         self.assertTrue(
-            portal_page.cssselect('div:contains("Location:"):contains("Main office")')
-        )
-        self.assertTrue(
             portal_page.cssselect(
-                'div:contains("Dates:")'
-                ':contains("03/01/2021 at (10:30:00 AM To 11:30:00 AM) (UTC)")'
+                '.o_rb_detail_row:contains("Location"):contains("Main office")'
             )
+        )
+        self.assertIn(
+            bookings[0].with_context(tz="UTC")._get_portal_start_display(),
+            portal_page.cssselect('.o_rb_detail_row:contains("Date and time")')[
+                0
+            ].text_content(),
         )
         # Portal guy cancels
         link = portal_page.cssselect('a:contains("Cancel this booking")')[0]

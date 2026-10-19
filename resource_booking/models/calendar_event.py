@@ -2,8 +2,12 @@
 # Copyright 2022 Tecnativa - Pedro M. Baeza
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
+from datetime import timedelta
+
 from odoo import api, fields, models
 from odoo.exceptions import ValidationError
+
+from .resource_booking import _BOOKING_DEADLINE_CHECKED
 
 
 class CalendarEvent(models.Model):
@@ -23,10 +27,27 @@ class CalendarEvent(models.Model):
         return bookings._check_scheduling()
 
     def _validate_booking_modifications(self):
-        """Make sure you can cancel a booking meeting."""
+        """Check the original deadline before changing or canceling a booking."""
         bookings = self.sudo().resource_booking_ids
-        modifiable = bookings.filtered("is_modifiable")
-        frozen = bookings - modifiable
+        # RPC context cannot forge this identity; IDs alone grant no exemption.
+        if self.env.context.get("_booking_deadline_token") is _BOOKING_DEADLINE_CHECKED:
+            checked_ids = self.env.context.get("_booking_deadline_event_ids", ())
+            bookings = bookings.filtered(
+                lambda booking: booking.meeting_id.id not in checked_ids
+            )
+        if bookings._can_override_scheduling():
+            return
+        # Booking.write may already have updated booking.start while syncing.
+        # The meeting still holds the original schedule until this write/unlink.
+        now = fields.Datetime.now()
+        frozen = bookings.filtered(
+            lambda booking: (
+                booking.meeting_id.start
+                and now
+                > booking.meeting_id.start
+                - timedelta(hours=booking.type_id.modifications_deadline)
+            )
+        )
         if frozen:
             raise ValidationError(
                 self.env._(
@@ -43,14 +64,23 @@ class CalendarEvent(models.Model):
 
     def write(self, vals):
         """Check you're allowed to reschedule it."""
-        before = [(one.start, one.stop) for one in self]
-        result = super().write(vals)
-        rescheduled = self
-        for (old_start, old_stop), new in zip(before, self, strict=True):
-            if old_start == new.start and old_stop == new.stop:
-                rescheduled -= new
+        schedule_fields = vals.keys() & {
+            "start",
+            "stop",
+            "duration",
+            "allday",
+            "start_date",
+            "stop_date",
+        }
+        rescheduled = self.filtered(
+            lambda event: any(
+                event._fields[name].convert_to_cache(vals[name], event)
+                != event._fields[name].convert_to_cache(event[name], event)
+                for name in schedule_fields
+            )
+        )
         rescheduled._validate_booking_modifications()
-        return result
+        return super().write(vals)
 
     @api.model_create_multi
     def create(self, vals_list):

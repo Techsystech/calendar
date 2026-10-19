@@ -4,7 +4,7 @@
 {
     "name": "Website Appointment Booking",
     "summary": "Public appointment booking pages for resource booking types",
-    "version": "18.0.1.1.0",
+    "version": "18.0.1.1.1",
     "development_status": "Beta",
     "category": "Appointments",
     "website": "https://github.com/OCA/calendar",

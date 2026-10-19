@@ -3,18 +3,17 @@
 
 import json
 import time
-from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import pytz
-from dateutil.parser import isoparse
 from werkzeug.exceptions import NotFound
 
-from odoo import fields, http
-from odoo.addons.base.models.res_partner import _tz_get
+from odoo import http
 from odoo.exceptions import ValidationError
 from odoo.http import request
 from odoo.tools.mail import plaintext2html
+
+from odoo.addons.base.models.res_partner import _tz_get
 
 
 class WebsiteAppointmentBooking(http.Controller):
@@ -179,7 +178,7 @@ class WebsiteAppointmentBooking(http.Controller):
         }
         if combination:
             values["combination_id"] = combination.id
-        return Booking.with_context(tz=tz).new(values)
+        return Booking.with_context(tz=tz, using_portal=True).new(values)
 
     def _serialize_slots(self, slots, time_format, tz_name):
         """Serialize slot data to a JSON-safe list of dicts.
@@ -371,16 +370,18 @@ class WebsiteAppointmentBooking(http.Controller):
             return request.redirect(
                 f"/book/{slug}{self._build_selection_query(selected_tz, selected_combination, error='Please fill in all fields.')}"
             )
-        # Parse the submitted datetime
+        # Validate before creating or updating contact details, including for managers
+        # using the public website. The phantom preserves resource selection semantics.
+        phantom = self._create_phantom_booking(
+            booking_type, tz=selected_tz, combination=selected_combination
+        )
         try:
-            when_tz_aware = isoparse(when_str)
-        except (ValueError, TypeError):
-            return request.redirect(
-                f"/book/{slug}{self._build_selection_query(selected_tz, selected_combination, error='Invalid date selected.')}"
+            when_naive = phantom._validate_submitted_slot(when_str)
+        except ValidationError as error:
+            query = self._build_selection_query(
+                selected_tz, selected_combination, error=str(error)
             )
-        when_naive = datetime.fromtimestamp(
-            when_tz_aware.timestamp(), tz=timezone.utc
-        ).replace(tzinfo=None)
+            return request.redirect(f"/book/{slug}{query}")
         # Find or create partner
         Partner = request.env["res.partner"].sudo()
         partner = Partner.search([("email", "=ilike", email)], limit=1)
@@ -417,7 +418,7 @@ class WebsiteAppointmentBooking(http.Controller):
                 booking.start = when_naive
         except ValidationError:
             # Race condition: slot was taken between page load and submit
-            month_str = f"{when_tz_aware:%Y/%m}"
+            month_str = f"{when_naive:%Y/%m}"
             return request.redirect(
                 f"/book/{slug}/{month_str}"
                 f"{self._build_selection_query(selected_tz, selected_combination, error='That slot is no longer available. Please choose another.')}"
