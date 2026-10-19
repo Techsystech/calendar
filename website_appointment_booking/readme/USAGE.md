@@ -6,5 +6,8 @@ Once a booking type is published:
 4. Clicking a time slot shows a simple form asking for name and email.
 5. Upon confirmation, a `resource.booking` record is created and confirmed
    automatically, and calendar invitations are sent to both parties.
-6. If a slot is no longer available (race condition), the visitor is redirected
-   back to the calendar with an informative error message.
+6. The server rechecks the submitted slot against minimum/maximum advance
+   notice, the offered start grid, and availability for the full duration before
+   updating contact details. This also applies to logged-in booking managers.
+7. If a slot is invalid or no longer available (race condition), the visitor is
+   redirected back to the calendar with an informative error message.

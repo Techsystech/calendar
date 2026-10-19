@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from dateutil.relativedelta import relativedelta
 from freezegun import freeze_time
-from pytz import utc
+from pytz import timezone, utc
 
 from odoo import Command, fields
 from odoo.exceptions import ValidationError
@@ -63,7 +63,384 @@ class BackendCaseMisc(BackendCaseBase):
         event.write({"partner_ids": [(4, self.partner.id)]})
         event.unlink()
 
+    def test_manager_rescheduling_keeps_resources_before_free_alternatives(self):
+        manager = self.env.ref("base.user_admin")
+        Booking = self.env["resource.booking"].with_user(manager)
+        self.rbt.combination_assignment = "sorted"
+        booking = Booking.create(
+            {
+                "type_id": self.rbt.id,
+                "partner_ids": [Command.link(self.partner.id)],
+                "start": "2021-03-01 08:00:00",
+            }
+        )
+        self.assertEqual(booking.combination_id, self.rbcs[0])
+        # Tuesday has free alternatives, but a manager must keep Monday's resources.
+        with Form(booking) as form:
+            form.start = "2021-03-02 10:00:00"
+            self.assertEqual(form.combination_id, self.rbcs[0])
+        booking.write({"start": "2021-03-03 10:00:00", "duration": 2})
+        self.assertEqual(booking.combination_id, self.rbcs[0])
+        self.assertEqual(booking.meeting_id.stop, datetime(2021, 3, 3, 12))
+        Booking.create(
+            {
+                "type_id": self.rbt.id,
+                "partner_ids": [Command.link(self.partner.id)],
+                "start": "2021-03-01 09:00:00",
+                "duration": 10,  # Explicit manager selection can exceed availability.
+                "combination_auto_assign": False,
+                "combination_id": self.rbcs[0].id,
+            }
+        )
+        booking.meeting_id.write(
+            {
+                "start": "2021-03-01 09:00:00",
+                "stop": "2021-03-01 12:00:00",
+            }
+        )
+        self.assertEqual(booking.start, datetime(2021, 3, 1, 9))
+        self.assertEqual(booking.duration, 3)
+        self.assertEqual(booking.combination_id, self.rbcs[0])
+        # Availability itself stays strict, even for the manager.
+        self.assertFalse(
+            self.rbcs[0]
+            .resource_ids[0]
+            .is_available(
+                utc.localize(datetime(2021, 3, 1, 9)),
+                utc.localize(datetime(2021, 3, 1, 10)),
+            )
+        )
+        booking.combination_auto_assign = False
+        booking.combination_auto_assign = True
+        self.assertEqual(booking.combination_id, self.rbcs[0])
+        other_type = self.rbt.copy(
+            {
+                "combination_rel_ids": [
+                    Command.clear(),
+                    Command.create(
+                        {
+                            "combination_id": self.rbcs[2].id,
+                        }
+                    ),
+                ],
+            }
+        )
+        booking.type_id = other_type
+        self.assertEqual(booking.combination_id, self.rbcs[2])
+        empty = self.env["resource.booking.combination"].create({"resource_ids": []})
+        for values in (
+            {"combination_auto_assign": False, "combination_id": empty.id},
+            {},  # No arbitrary fallback for a new automatic booking on Wednesday.
+        ):
+            with (
+                self.subTest(values=values),
+                self.assertRaises(ValidationError),
+                self.env.cr.savepoint(),
+            ):
+                Booking.create(
+                    {
+                        "type_id": self.rbt.id,
+                        "partner_ids": [Command.link(self.partner.id)],
+                        "start": "2021-03-03 10:00:00",
+                        **values,
+                    }
+                )
+
+    def test_rescheduling_override_requires_actual_internal_manager(self):
+        user = new_test_user(
+            self.env,
+            login="booking_user",
+            groups="base.group_user,resource_booking.group_user",
+        )
+        booking = self.env["resource.booking"].create(
+            {
+                "type_id": self.rbt.id,
+                "partner_ids": [Command.link(user.partner_id.id)],
+                "start": "2021-03-01 08:00:00",
+                "combination_id": self.rbcs[0].id,
+                "combination_auto_assign": False,
+            }
+        )
+        actors = (
+            booking.with_user(user),
+            booking.with_user(user).sudo(),
+            booking.with_user(self.env.ref("base.user_admin")).with_context(
+                using_portal=True
+            ),
+        )
+        for actor in actors:
+            for record, values in (
+                (actor, {"start": "2021-03-02 08:00:00"}),
+                (actor, {"duration": 10}),
+                (
+                    actor.meeting_id,
+                    {"start": "2021-03-02 08:00:00", "stop": "2021-03-02 09:00:00"},
+                ),
+            ):
+                with (
+                    self.subTest(uid=actor.env.uid, su=actor.env.su, values=values),
+                    self.assertRaises(ValidationError),
+                    self.env.cr.savepoint(),
+                ):
+                    record.write(values)
+        self.assertEqual(booking.start, datetime(2021, 3, 1, 8))
+        self.assertEqual(booking.combination_id, self.rbcs[0])
+
+    def test_modification_deadline_uses_original_schedule_not_initial_booking(self):
+        self.rbt.resource_calendar_id = self.r_calendars[3]
+        booking = (
+            self.env["resource.booking"]
+            .with_context(using_portal=True)
+            .create(
+                {
+                    "type_id": self.rbt.id,
+                    "partner_ids": [Command.link(self.partner.id)],
+                    "combination_id": self.rbcs[3].id,
+                    "combination_auto_assign": False,
+                }
+            )
+        )
+        # First-time scheduling inside the modification deadline remains valid.
+        booking.start = "2021-02-26 12:00:00"
+        booking.write({"name": "Metadata", "start": booking.start})
+        booking.meeting_id.write({"name": "Metadata", "start": booking.start})
+        booking.action_confirm()
+        for record, values in (
+            (booking, {"start": "2021-03-05 12:00:00"}),
+            (booking, {"duration": 2}),
+            (
+                booking.meeting_id,
+                {"start": "2021-03-05 12:00:00", "stop": "2021-03-05 13:00:00"},
+            ),
+            (booking.meeting_id, {"stop": "2021-02-26 14:00:00"}),
+        ):
+            with (
+                self.subTest(values=values),
+                self.assertRaises(ValidationError),
+                self.env.cr.savepoint(),
+            ):
+                record.write(values)
+        with self.assertRaises(ValidationError), self.env.cr.savepoint():
+            booking.meeting_id.unlink()
+        self.assertEqual(booking.start, datetime(2021, 2, 26, 12))
+        booking.with_context(using_portal=False).start = "2021-02-28 12:00:00"
+        # The OLD deadline allows moving into short notice, not the other way around.
+        booking.start = "2021-02-26 13:00:00"
+        self.assertEqual(booking.meeting_id.start, datetime(2021, 2, 26, 13))
+
+    def test_mixed_type_reschedule_uses_original_modification_deadline(self):
+        user = new_test_user(
+            self.env,
+            login="deadline_user",
+            groups="base.group_user,resource_booking.group_user",
+        )
+        self.rbt.write(
+            {
+                "resource_calendar_id": self.r_calendars[3].id,
+                "modifications_deadline": 0,
+            }
+        )
+        stricter_type = self.rbt.copy({"modifications_deadline": 24})
+        original_start = datetime(2021, 2, 26, 21)  # Twelve hours from now.
+        future_start = original_start + timedelta(days=7)
+        booking = self.env["resource.booking"].with_user(user).create(
+            {
+                "type_id": self.rbt.id,
+                "partner_ids": [Command.link(user.partner_id.id)],
+                "combination_id": self.rbcs[3].id,
+                "combination_auto_assign": False,
+                "start": original_start,
+                "duration": 1,
+            }
+        )
+        event = booking.meeting_id
+        booking_id = booking.id
+        self.assertFalse(booking.env.su)
+        self.assertFalse(booking._can_override_scheduling())
+        booking.write({"type_id": stricter_type.id, "start": future_start})
+        self.assertEqual(booking.id, booking_id)
+        self.assertEqual(booking.meeting_id, event)
+        self.assertEqual(booking.type_id, stricter_type)
+        self.assertEqual(booking.start, future_start)
+        self.assertEqual(event.start, future_start)
+        # Moving back into short notice is allowed by the still-open old deadline.
+        booking.write({"start": original_start})
+        forged_context = {
+            "_booking_deadline_token": True,
+            "_booking_deadline_event_ids": event.ids,
+            "syncing_booking_ids": booking.ids,
+        }
+        for context in ({}, forged_context):
+            for record, values in (
+                (booking, {"type_id": self.rbt.id, "start": future_start}),
+                (
+                    event,
+                    {"start": future_start, "stop": future_start + timedelta(hours=1)},
+                ),
+            ):
+                with (
+                    self.subTest(context=context, model=record._name),
+                    self.assertRaises(ValidationError),
+                    self.env.cr.savepoint(),
+                ):
+                    record.with_context(**context).write(values)
+            with self.assertRaises(ValidationError), self.env.cr.savepoint():
+                event.with_context(**context).unlink()
+        self.assertEqual(booking.type_id, stricter_type)
+        self.assertEqual(booking.start, original_start)
+        self.assertEqual(booking.meeting_id, event)
+
+    @freeze_time("2021-02-26 09:00:00")
+    def test_submitted_slot_validation_reuses_strict_slots(self):
+        self.rbt.write({"min_advance_booking_hours": 72, "max_advance_booking_days": 4})
+        booking = self.env["resource.booking"].create(
+            {
+                "type_id": self.rbt.id,
+                "partner_ids": [Command.link(self.partner.id)],
+                "combination_id": self.rbcs[0].id,
+                "combination_auto_assign": False,
+                "duration": 1.5,
+                "start": "2021-03-01 10:00:00",
+            }
+        )
+        # Excludes the booking's own meeting and normalizes offset-aware input to UTC.
+        self.assertEqual(
+            booking._validate_submitted_slot("2021-03-01T12:00:00+02:00"),
+            datetime(2021, 3, 1, 10),
+        )
+        for when in (
+            "bad-date",
+            "2021-03-01T10:00:00",
+            "2021-02-22T10:00:00Z",
+            "2021-03-01T08:00:00Z",
+            "2021-03-02T10:00:00Z",
+            "2021-03-01T10:15:00Z",
+            "2021-03-01T16:00:00Z",
+        ):
+            with self.subTest(when=when), self.assertRaises(ValidationError):
+                booking._validate_submitted_slot(when)
+        self.assertEqual(booking.start, datetime(2021, 3, 1, 10))
+        self.rbt.max_advance_booking_days = 0
+        self.assertEqual(
+            booking._validate_submitted_slot("2021-03-22T10:00:00Z"),
+            datetime(2021, 3, 22, 10),
+        )
+        # A displayed union slot must still fit one full resource combination.
+        morning = self.r_calendars[0].copy()
+        morning.attendance_ids.hour_to = 12
+        afternoon = self.r_calendars[0].copy()
+        afternoon.attendance_ids.hour_from = 12
+        self.rbcs[0].forced_calendar_id = morning
+        self.rbcs[2].forced_calendar_id = afternoon
+        phantom = self.env["resource.booking"].new(
+            {
+                "type_id": self.rbt.id,
+                "duration": 2,
+            }
+        )
+        slots = phantom.with_context(using_portal=True, tz="UTC")._get_calendar_context(
+            2021, 3
+        )["slots"]
+        self.assertIn(utc.localize(datetime(2021, 3, 8, 11)), slots[date(2021, 3, 8)])
+        with self.assertRaisesRegex(
+            ValidationError, "No resource combinations available"
+        ):
+            phantom._validate_submitted_slot("2021-03-08T11:00:00Z")
+
+    def test_submitted_slot_validation_preserves_multiday_grid(self):
+        self.rbt.write(
+            {
+                "resource_calendar_id": self.r_calendars[3].id,
+                "slot_duration": 7,
+                "min_advance_booking_hours": 0,
+                "max_advance_booking_days": 0,
+            }
+        )
+        phantom = (
+            self.env["resource.booking"]
+            .with_context(using_portal=True, tz="UTC")
+            .new(
+                {
+                    "type_id": self.rbt.id,
+                    "duration": 1,
+                    "combination_id": self.rbcs[3].id,
+                    "combination_auto_assign": False,
+                }
+            )
+        )
+        slots = phantom._get_calendar_context(2021, 3)["slots"]
+        # Friday's continuous interval anchors Saturday at 04:00, not midnight.
+        self.assertIn(utc.localize(datetime(2021, 3, 6, 4)), slots[date(2021, 3, 6)])
+        for day in (date(2021, 3, 6), date(2021, 3, 7)):
+            for start in slots[day]:
+                with self.subTest(start=start):
+                    self.assertEqual(
+                        phantom._validate_submitted_slot(start.isoformat()),
+                        start.replace(tzinfo=None),
+                    )
+        midnight = utc.localize(datetime(2021, 3, 6))
+        self.assertNotIn(midnight, slots[midnight.date()])
+        with self.assertRaises(ValidationError):
+            phantom._validate_submitted_slot(midnight.isoformat())
+
+    @freeze_time("2021-04-30 00:00:00")
+    def test_submitted_slot_validation_preserves_display_timezone_grid(self):
+        calendar = self.r_calendars[3].copy(
+            {
+                "attendance_ids": [
+                    Command.create(
+                        {
+                            "name": "All day",
+                            "dayofweek": str(day),
+                            "hour_from": 0,
+                            "hour_to": 24,
+                            "day_period": "morning",
+                        }
+                    )
+                    for day in range(7)
+                ],
+            }
+        )
+        self.rbt.write(
+            {
+                "resource_calendar_id": calendar.id,
+                "slot_duration": 7,
+                "min_advance_booking_hours": 0,
+                "max_advance_booking_days": 0,
+            }
+        )
+        self.rbcs[3].forced_calendar_id = calendar
+        values = {
+            "type_id": self.rbt.id,
+            "duration": 1,
+            "combination_id": self.rbcs[3].id,
+            "combination_auto_assign": False,
+        }
+        for tz, hour in (("UTC", 0), ("Asia/Tokyo", 14)):
+            with self.subTest(tz=tz):
+                # A subtest clears ORM caches, including non-persistent records.
+                booking = self.env["resource.booking"].with_context(
+                    using_portal=True, tz=tz
+                ).new(values)
+                display_tz = timezone(tz)
+                slots = booking._get_calendar_context(2021, 5)["slots"]
+                starts = [start for values in slots.values() for start in values]
+                # The selected month's boundary anchors the continuous 7-hour grid.
+                self.assertIn(display_tz.localize(datetime(2021, 5, 1, hour)), starts)
+                for start in starts:
+                    local = start.astimezone(display_tz)
+                    if local.date() == date(2021, 5, 1):
+                        self.assertEqual(
+                            booking._validate_submitted_slot(local.isoformat()),
+                            start.astimezone(utc).replace(tzinfo=None),
+                        )
+                midnight = display_tz.localize(datetime(2021, 5, 2))
+                self.assertNotIn(midnight, starts)
+                with self.assertRaises(ValidationError):
+                    booking._validate_submitted_slot(midnight.isoformat())
+
     def test_scheduling_conflict_constraints(self):
+        self.env = self.env(context=dict(self.env.context, using_portal=True))
         # Combination is available on Mondays and Tuesdays
         rbc_montue = self.rbcs[2]
         # Type is available on Mondays
@@ -136,6 +513,7 @@ class BackendCaseMisc(BackendCaseBase):
         )
 
     def test_scheduling_constraints_span_two_days(self):
+        self.env = self.env(context=dict(self.env.context, using_portal=True))
         # Booking can span across two calendar days.
         cal_frisun = self.r_calendars[3]
         rbc_frisun = self.rbcs[3]
@@ -254,6 +632,7 @@ class BackendCaseMisc(BackendCaseBase):
         )
 
     def test_rbc_forced_calendar(self):
+        self.env = self.env(context=dict(self.env.context, using_portal=True))
         # Type is available on Mondays
         cal_mon = self.r_calendars[0]
         self.rbt.resource_calendar_id = cal_mon
@@ -316,7 +695,9 @@ class BackendCaseMisc(BackendCaseBase):
         self.assertTrue(booking.meeting_id)
         self.assertEqual(booking.state, "scheduled")
 
-    def test_meeting_description_combines_booking_description_and_requester_advice(self):
+    def test_meeting_description_combines_booking_description_and_requester_advice(
+        self,
+    ):
         """Portal description should be combined with the type's default requester advice."""
         self.rbt.requester_advice = "Please bring your ID."
         booking = self.env["resource.booking"].create(
@@ -503,7 +884,9 @@ class BackendCaseMisc(BackendCaseBase):
             {
                 "name": "Other booking option",
                 "combination_rel_ids": [
-                    Command.create({"sequence": 0, "combination_id": shared_user_combination.id})
+                    Command.create(
+                        {"sequence": 0, "combination_id": shared_user_combination.id}
+                    )
                 ],
                 "duration": 1.0,
                 "min_advance_booking_hours": 0,
@@ -642,6 +1025,7 @@ class BackendCaseMisc(BackendCaseBase):
 
     def test_sorted_assignment(self):
         """Set sorted assignment on RBT and test it works correctly."""
+        self.env = self.env(context=dict(self.env.context, using_portal=True))
         rbc_mon, rbc_tue, rbc_montue, rbc_frisun = self.rbcs
         with Form(self.rbt) as rbt_form:
             rbt_form.combination_assignment = "sorted"
@@ -703,6 +1087,7 @@ class BackendCaseMisc(BackendCaseBase):
 
     def test_same_slot_twice_not_utc(self):
         """Scheduling the same slot twice fails, when not in UTC."""
+        self.env = self.env(context=dict(self.env.context, using_portal=True))
         for loop in range(2):
             rb_f = Form(self.env["resource.booking"].with_context(tz="Europe/Madrid"))
             rb_f.partner_ids.add(self.partner)
@@ -752,6 +1137,7 @@ class BackendCaseMisc(BackendCaseBase):
         scheduling search (which queries on start/stop datetimes), so the
         booking is incorrectly accepted.
         """
+        self.env = self.env(context=dict(self.env.context, using_portal=True))
         user = self.users[0]
         self.env["calendar.event"].create(
             {
@@ -781,6 +1167,7 @@ class BackendCaseMisc(BackendCaseBase):
         """Calendar changes are allowed even when confirmed bookings exist,
         but new or rescheduled bookings must still respect the updated calendar.
         """
+        self.env = self.env(context=dict(self.env.context, using_portal=True))
         rbc_mon = self.rbcs[0]
         cal_mon = self.r_calendars[0]
         # There's a booking for last monday
@@ -998,8 +1385,8 @@ class BackendCaseMisc(BackendCaseBase):
         rb.name = False
         self.assertEqual(
             rb.display_name,
-            "some customer - Test resource booking type "
-            "- 03/01/2021 at (08:00:00 AM To 08:30:00 AM) (UTC)",
+            "some customer - Test resource booking type - "
+            f"{rb.meeting_id.display_time}",
         )
         self.assertEqual(
             rb.with_context(using_portal=True).display_name, "# %d" % rb.id

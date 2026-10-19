@@ -4,6 +4,7 @@
 import base64
 import json
 from datetime import datetime
+from unittest.mock import patch
 
 from freezegun import freeze_time
 from lxml.html import fromstring
@@ -12,6 +13,9 @@ from odoo.tests import tagged
 from odoo.tests.common import HttpCase
 
 from odoo.addons.resource_booking.tests.common import create_test_data
+from odoo.addons.website_appointment_booking.controllers.main import (
+    WebsiteAppointmentBooking,
+)
 
 
 @freeze_time("2021-02-26 09:00:00", tick=True)
@@ -412,6 +416,55 @@ class TestWebsiteAppointmentBooking(HttpCase):
         }
         response = self.url_open("/book/test-booking/confirm", data=data)
         self.assertIn("error=", response.url)
+
+    def test_confirm_invalid_slots_do_not_write_contacts_or_bookings(self):
+        self.rbt.write({"min_advance_booking_hours": 72, "max_advance_booking_days": 4})
+        partner = self.env["res.partner"].create(
+            {
+                "name": "Untouched contact",
+                "email": "invalid-slot@example.com",
+            }
+        )
+        self.authenticate("admin", "admin")
+        page = self._url_xml("/book/test-booking/2021/3")
+        csrf = self._get_csrf_token(page)
+        before = self.env["resource.booking"].search_count(
+            [("type_id", "=", self.rbt.id)]
+        )
+        # Avoid the independent anti-spam throttle hiding slot validation failures.
+        with patch.object(
+            WebsiteAppointmentBooking, "_check_rate_limit", return_value=(True, None)
+        ):
+            for when in (
+                "invalid",
+                "2021-03-01T10:00:00",
+                "2021-03-01T10:15:00Z",
+                "2021-03-01T08:00:00Z",
+                "2021-03-02T10:00:00Z",
+                "2021-03-01T17:00:00Z",
+            ):
+                with self.subTest(when=when):
+                    response = self.url_open(
+                        "/book/test-booking/confirm",
+                        data={
+                            "csrf_token": csrf,
+                            "name": "Changed contact",
+                            "email": partner.email,
+                            "phone": "+1 555-9999",
+                            "when": when,
+                            "combination_id": str(self.rbcs[0].id),
+                        },
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIn("error=", response.url)
+                    partner.invalidate_recordset()
+                    self.assertFalse(partner.phone)
+                    self.assertEqual(
+                        self.env["resource.booking"].search_count(
+                            [("type_id", "=", self.rbt.id)]
+                        ),
+                        before,
+                    )
 
     def test_confirm_invalid_date(self):
         """Submitting with invalid datetime redirects with error."""

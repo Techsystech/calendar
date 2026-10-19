@@ -6,6 +6,7 @@
 import calendar
 from datetime import datetime, timedelta
 
+from dateutil.parser import isoparse
 from dateutil.relativedelta import relativedelta
 from pytz import timezone, utc
 
@@ -14,6 +15,8 @@ from odoo.exceptions import ValidationError
 from odoo.tools.mail import plaintext2html
 
 from odoo.addons.resource.models.utils import Intervals
+
+_BOOKING_DEADLINE_CHECKED = object()
 
 
 def _merge_intervals(intervals):
@@ -295,16 +298,21 @@ class ResourceBooking(models.Model):
             deadline = one.start - anticipation
             one.is_overdue = now > deadline
 
+    def _can_override_scheduling(self):
+        """Only actual internal managers outside the portal can override policy."""
+        return (
+            not self.env.context.get("using_portal")
+            and self.env.user._is_internal()
+            and self.env.user.has_group("resource_booking.group_manager")
+        )
+
     @api.depends("is_overdue")
     @api.depends_context("uid", "using_portal")
     def _compute_is_modifiable(self):
         """Indicate if the booking is modifiable."""
         self.is_modifiable = True
-        is_manager = not self.env.context.get(
-            "using_portal"
-        ) and self.env.user.has_group("resource_booking.group_manager")
-        # Managers can always modify overdue bookings
-        if not is_manager:
+        # Managers can always modify overdue bookings.
+        if not self._can_override_scheduling():
             overdue = self.filtered("is_overdue")
             overdue.is_modifiable = False
 
@@ -495,6 +503,9 @@ class ResourceBooking(models.Model):
                     "\n- ".join(missing_rbc.mapped("display_name")),
                 )
             )
+        # Availability overrides never waive the resource requirement above.
+        if self._can_override_scheduling():
+            return
         # Ensure all bookings fit in their type and resources calendars
         unfitting_bookings = has_meeting
         now = fields.Datetime.now()
@@ -570,10 +581,19 @@ class ResourceBooking(models.Model):
         # No dates? Then return whatever is already selected (can be empty)
         if not self.start:
             return self.combination_id
-        # If there's a combination already, put it 1st (highest priority)
-        sorted_combinations = self.combination_id + (
-            self.type_id._get_combinations_priorized() - self.combination_id
-        )
+        combinations = self.type_id._get_combinations_priorized()
+        current = self.combination_id & combinations
+        # Onchange records must retain the persisted resources too. A type change
+        # must not carry an old combination into a type that doesn't offer it.
+        if not current and self._origin.type_id == self.type_id:
+            current = self._origin.combination_id & combinations
+        if (
+            current
+            and (self.meeting_id or self._origin.meeting_id)
+            and self._can_override_scheduling()
+        ):
+            return current
+        sorted_combinations = current + (combinations - current)
         start_dt = fields.Datetime.context_timestamp(self, self.start)
         end_dt = fields.Datetime.context_timestamp(self, self.stop)
         # Get 1st combination available in the desired interval
@@ -607,6 +627,8 @@ class ResourceBooking(models.Model):
         if max_advance_days:
             max_start_dt = now + timedelta(days=max_advance_days)
             end_dt = min(end_dt, max_start_dt + booking_duration)
+        if start_dt >= end_dt:
+            return result
         # available_intervals should start with the beginning of the work day,
         # to compute each slot based on the beginning of the work day.
         workday_min = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -630,6 +652,42 @@ class ResourceBooking(models.Model):
                     result[test_start.date()].append(test_start)
                 test_start += slot_duration
         return result
+
+    def _validate_submitted_slot(self, when):
+        """Validate an offered aware slot and return its UTC-naive start."""
+        self.ensure_one()
+        tz = self.env.context.get("tz") or self._get_portal_timezone()
+        try:
+            submitted = isoparse(when)
+            if submitted.tzinfo is None or submitted.utcoffset() is None:
+                raise ValueError("A timezone is required")
+            submitted = submitted.astimezone(utc)
+            local = submitted.astimezone(timezone(tz))
+        except (ValueError, TypeError, OverflowError) as error:
+            raise ValidationError(self.env._("Invalid date selected.")) from error
+        booking = self.with_context(using_portal=True, tz=tz)
+        if self.duration <= 0 or self.type_id.slot_duration <= 0:
+            raise ValidationError(self.env._("Invalid booking duration."))
+        # Reuse the rendered month's grid; continuous intervals can span days.
+        slots = booking._get_calendar_context(local.year, local.month)["slots"]
+        if not any(submitted in starts for starts in slots.values()):
+            raise ValidationError(
+                self.env._("That slot is no longer available. Please choose another.")
+            )
+        start = submitted.replace(tzinfo=None)
+        # A union of free intervals can span different combinations. Ensure one
+        # combination can cover the entire booking, without changing this record.
+        booking.new(
+            {
+                "type_id": booking.type_id.id,
+                "duration": booking.duration,
+                "start": start,
+                "combination_id": booking.combination_id.id,
+                "combination_auto_assign": booking.combination_auto_assign,
+            },
+            origin=booking._origin,
+        )._get_best_combination()
+        return start
 
     def _get_buffered_booking_intervals(self, start_dt, end_dt, combination):
         """Return resource-level post-booking buffer intervals for a combination."""
@@ -721,10 +779,36 @@ class ResourceBooking(models.Model):
         return result
 
     def write(self, vals):
-        """Sync booking with meeting if needed."""
+        """Validate the original schedule before syncing changes with the meeting."""
+        schedule_fields = vals.keys() & {
+            "start",
+            "stop",
+            "duration",
+            "meeting_id",
+            "type_id",
+        }
+        changed = self.filtered(
+            lambda booking: (
+                booking.meeting_id
+                and any(
+                    booking._fields[name].convert_to_cache(vals[name], booking)
+                    != booking._fields[name].convert_to_cache(booking[name], booking)
+                    for name in schedule_fields
+                )
+            )
+        )
+        checked_meetings = changed.meeting_id
+        checked_meetings._validate_booking_modifications()
         result = super().write(vals)
         if set(vals) != {"access_token"}:
-            self._sync_meeting()
+            syncing = self
+            if checked_meetings:
+                # Preserve the old type/start decision only for this nested sync.
+                syncing = self.with_context(
+                    _booking_deadline_token=_BOOKING_DEADLINE_CHECKED,
+                    _booking_deadline_event_ids=tuple(checked_meetings.ids),
+                )
+            syncing._sync_meeting()
         if vals.get("start") or "meeting_id" in vals:
             self._sync_booking_activities_date()
         return result

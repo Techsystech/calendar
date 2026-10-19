@@ -2,7 +2,7 @@
 # Copyright 2022 Tecnativa - Pedro M. Baeza
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
-from datetime import datetime
+from urllib.parse import urlencode
 
 from dateutil.parser import isoparse
 
@@ -141,15 +141,21 @@ class CustomerPortal(portal.CustomerPortal):
     def portal_booking_confirm(self, booking_id, access_token, when, **kwargs):
         """Confirm a booking in a given datetime."""
         booking_sudo = self._get_booking_sudo(booking_id, access_token)
-        when_tz_aware = isoparse(when)
-        when_naive = datetime.utcfromtimestamp(when_tz_aware.timestamp())
         try:
-            booking_sudo.start = when_naive
+            with request.env.cr.savepoint():
+                when_naive = booking_sudo._validate_submitted_slot(when)
+                booking_sudo.start = when_naive
+                booking_sudo.action_confirm()
         except ValidationError as error:
+            # Keep the submitted month visible after a slot conflict. Parsing here
+            # is only for navigation; the shared model validator owns acceptance.
+            try:
+                suffix = f"/schedule/{isoparse(when):%Y/%m}"
+            except (ValueError, TypeError, OverflowError):
+                suffix = "/schedule"
             url = booking_sudo.get_portal_url(
-                suffix=f"/schedule/{when_tz_aware:%Y/%m}",
-                query_string=f"&error={error.args[0]}",
+                suffix=suffix,
+                query_string="&" + urlencode({"error": str(error)}),
             )
             return request.redirect(url)
-        booking_sudo.action_confirm()
         return request.redirect(booking_sudo.get_portal_url())

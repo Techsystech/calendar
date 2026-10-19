@@ -24,6 +24,16 @@ To book some resources:
 6.  Uncheck *Auto assign* and pick one *Resources combination*, in case
     the one assigned automatically isn't the one you want.
 
+Internal *Resource Booking > Manager* users can move or resize a scheduled
+booking in the backend even when resources are busy or outside their working
+calendar. Automatic rescheduling keeps its existing resource combination
+while that combination still belongs to the booking type. New automatic
+bookings still select an available combination; managers can instead select
+a combination manually to override availability. A scheduled booking must
+always have resources. This override also applies when managers change
+related booking calendars or combinations; it does not change displayed
+availability or allow portal/website visitors to bypass slot restrictions.
+
 To invite someone to book a resource combination from the portal:
 
 1.  Go to *Resource Bookings \> Types*.
