@@ -298,8 +298,7 @@
                                                     >
                                                         <option
                                                             t-att-value="timezone_option[0]"
-                                                            t-att-data-tz-group="timezone_groups[timezone_option[0]][0]"
-                                                            t-att-data-tz-changes="'1' if timezone_groups[timezone_option[0]][1] else '0'"
+                                                            t-att-data-tz-group="timezone_groups[timezone_option[0]]"
                                                             t-att-selected="timezone_option[0] == selected_tz and 'selected' or None"
                                                         >
                                                             <t t-out="timezone_option[1]" />

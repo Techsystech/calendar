@@ -22,7 +22,7 @@ const {chromium} = require('playwright');
         );
         await waitZone('America/Los_Angeles');
         await page.waitForSelector('#o_wab_timezone[data-ready="true"]');
-        assert.match(await page.locator('#o_wab_timezone option:checked').innerText(), /Pacific (?:(?:Standard|Daylight) Time \(UTC-0[78]:00\)|Time \(UTC offset varies this month\))/);
+        assert.equal(await page.locator('#o_wab_timezone option:checked').innerText(), 'Pacific Time');
         assert(await page.locator('.o_wab_tz_detected').isVisible());
         assert.equal(await page.locator('#o_wab_timezone_search').count(), 0);
         assert(await page.locator('#o_wab_timezone').evaluate(el =>
@@ -95,18 +95,21 @@ const {chromium} = require('playwright');
         summer.searchParams.set('tz', 'America/Los_Angeles');
         await saved.goto(summer.toString());
         await saved.waitForSelector('#o_wab_timezone[data-ready="true"]');
-        assert.match(await saved.locator('#o_wab_timezone option:checked').innerText(), /Pacific Daylight Time \(UTC-07:00\)/);
+        assert.equal(await saved.locator('#o_wab_timezone option:checked').innerText(), 'Pacific Time');
         assert(await saved.locator('.o_wab_tz_detected').isVisible());
         summer.pathname = new URL(url).pathname + `/${futureYear}/3`;
         await saved.goto(summer.toString());
         await saved.waitForSelector('#o_wab_timezone[data-ready="true"]');
-        assert.match(await saved.locator('#o_wab_timezone option:checked').innerText(), /Pacific Time \(UTC offset varies this month\)/);
+        assert.equal(await saved.locator('#o_wab_timezone option:checked').innerText(), 'Pacific Time');
+        await saved.locator('#o_wab_timezone').selectOption('America/Chicago');
+        await saved.waitForFunction(() => document.querySelector('#o_wab_slot_data').dataset.selectedTz === 'America/Chicago');
+        assert.equal(await saved.locator('#o_wab_timezone option:checked').innerText(), 'Central Time');
         await saved.setViewportSize({width: 375, height: 800});
         assert(await saved.locator('#o_wab_timezone').evaluate(el =>
             el.getBoundingClientRect().right <= window.innerWidth
         ));
         assert.deepEqual(errors, []);
-        console.log(`PASS: ${optionCount} grouped zones; compact width, detected marker, no search, DST-safe grouping, seasonal labels, persistence and failure recovery; no reloads or JS exceptions.`);
+        console.log(`PASS: ${optionCount} grouped zones; plain timezone names across seasons, detected marker, DST-safe grouping, persistence and failure recovery; no reloads or JS exceptions.`);
     } finally {
         await browser.close();
     }
