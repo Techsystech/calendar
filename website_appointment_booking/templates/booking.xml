@@ -159,7 +159,7 @@
                                 <div class="o_wab_cal_grid">
                                     <!-- Left: Calendar -->
                                     <div>
-                                        <t t-if="slots and len(combination_options) &gt; 1">
+                                        <t t-if="len(combination_options) &gt; 1">
                                             <div class="o_wab_combination mb-3 text-center">
                                                 <div class="text-muted small mb-2">with</div>
                                                 <div
@@ -216,8 +216,8 @@
                                         </div>
 
                                         <!-- No slots this month -->
-                                        <t t-if="not slots">
-                                            <div class="o_wab_empty_month">
+                                        <t>
+                                            <div t-attf-class="o_wab_empty_month#{' d-none' if slots else ''}">
                                                 <i class="fa fa-calendar-o d-block o_wab_empty_month_icon" />
                                                 <p class="mb-2">
                                                     No available slots this month.
@@ -232,10 +232,10 @@
                                             </div>
                                         </t>
 
-                                        <t t-if="slots">
+                                        <t>
                                             <!-- Calendar table -->
                                             <table
-                                                class="table text-center o_wab_table mb-2"
+                                                t-attf-class="table text-center o_wab_table mb-2#{'' if slots else ' d-none'}"
                                             >
                                                 <thead>
                                                     <tr>
@@ -288,7 +288,8 @@
                                                 >Timezone:</label>
                                                 <select
                                                     id="o_wab_timezone"
-                                                    class="form-select form-select-sm o_wab_timezone_select w-auto"
+                                                    class="form-select form-select-sm o_wab_timezone_select"
+                                                    style="width: 17rem; max-width: 100%;"
                                                     aria-label="Timezone"
                                                 >
                                                     <t
@@ -297,15 +298,19 @@
                                                     >
                                                         <option
                                                             t-att-value="timezone_option[0]"
+                                                            t-att-data-tz-group="timezone_groups[timezone_option[0]][0]"
+                                                            t-att-data-tz-changes="'1' if timezone_groups[timezone_option[0]][1] else '0'"
                                                             t-att-selected="timezone_option[0] == selected_tz and 'selected' or None"
                                                         >
                                                             <t t-out="timezone_option[1]" />
                                                         </option>
                                                     </t>
                                                 </select>
+                                                <span class="o_wab_tz_detected text-muted small d-none">Detected</span>
                                             </div>
                                             <p
                                                 class="o_wab_tz_note text-center mt-3 mb-0"
+                                                role="status"
                                             >
                                                 Displayed times update for the selected timezone.
                                             </p>
@@ -313,7 +318,7 @@
                                     </div>
 
                                     <!-- Right: Slots panel -->
-                                    <t t-if="slots">
+                                    <t>
                                         <div>
                                             <div
                                                 id="o_wab_slots_panel"
@@ -325,7 +330,7 @@
                                             <!-- Placeholder before day selection -->
                                             <div
                                                 id="o_wab_slots_empty"
-                                                class="o_wab_slots_panel o_wab_slots_empty"
+                                                t-attf-class="o_wab_slots_panel o_wab_slots_empty#{'' if slots else ' d-none'}"
                                             >
                                                 <i class="fa fa-hand-pointer-o" />
                                                 <span
@@ -336,7 +341,7 @@
                                 </div>
 
                                 <!-- Hidden slot data for JS -->
-                                <t t-if="slots">
+                                <t>
                                     <div
                                         class="d-none"
                                         id="o_wab_slot_data"

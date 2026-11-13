@@ -11,6 +11,8 @@
  */
 
 import publicWidget from "@web/legacy/js/public/public_widget";
+import {cookie} from "@web/core/browser/cookie";
+import {_t} from "@web/core/l10n/translation";
 
 publicWidget.registry.WebsiteAppointmentBooking = publicWidget.Widget.extend({
     selector: ".o_wab_calendar",
@@ -51,7 +53,79 @@ publicWidget.registry.WebsiteAppointmentBooking = publicWidget.Widget.extend({
             this.dataEl.dataset.selectedTz || "UTC",
             this.dataEl.dataset.selectedCombinationId || ""
         );
-        return this._super(...arguments);
+        return Promise.resolve(this._super(...arguments)).then(() => this._initTimezone());
+    },
+
+    async _initTimezone() {
+        const locale = document.documentElement.lang.replace("_", "-") || undefined;
+        const canonical = zone => {
+            try {
+                return new Intl.DateTimeFormat(undefined, {timeZone: zone}).resolvedOptions().timeZone;
+            } catch (_error) {
+                return zone; // Keep server zones newer than the browser's timezone data.
+            }
+        };
+        const browserZone = canonical(Intl.DateTimeFormat().resolvedOptions().timeZone);
+        const zones = new Map();
+        const aliases = new Map();
+        const common = ["America/New_York", "America/Chicago", "America/Denver",
+            "America/Los_Angeles", "America/Anchorage", "Pacific/Honolulu", "UTC"];
+        const rank = option => option.selected ? -3 : canonical(option.value) === browserZone ? -2 :
+            common.includes(option.value) ? -1 : 0;
+        const options = [...this.timezoneSelect.options].sort((a, b) => rank(a) - rank(b));
+        const reference = new Date(Date.UTC(this.displayedYear, this.displayedMonth - 1, 15, 12));
+        for (const option of options) {
+            const part = type => {
+                try {
+                    return new Intl.DateTimeFormat(locale, {
+                        timeZone: option.value, timeZoneName: type,
+                    }).formatToParts(reference).find(part => part.type === "timeZoneName").value;
+                } catch (_error) {
+                    return option.value;
+                }
+            };
+            // Same name/offset today isn't enough: retain distinct future DST rules.
+            const key = `${part("longGeneric")}/${option.dataset.tzGroup}`;
+            if (!zones.has(key)) {
+                option.textContent = option.dataset.tzChanges === "1"
+                    ? `${part("longGeneric")} (${_t("UTC offset varies this month")})`
+                    : `${part("long")} (${part("longOffset").replace("GMT", "UTC")})`;
+                zones.set(key, option);
+            }
+            aliases.set(canonical(option.value), zones.get(key));
+        }
+        const labels = new Set();
+        for (const option of zones.values()) {
+            const label = option.textContent;
+            if (labels.has(label)) {
+                // A city is only needed to distinguish otherwise identical DST variants.
+                option.textContent += ` — ${option.value.split("/").pop().replaceAll("_", " ")}`;
+            }
+            labels.add(label);
+        }
+        this.detectedTimezone = aliases.get(browserZone)?.value;
+        this.timezoneSelect.replaceChildren(...[...zones.values()].sort((a, b) =>
+            rank(a) - rank(b) || a.textContent.localeCompare(b.textContent, locale)
+        ));
+        this._syncTimezone();
+        this._updateSelectionLinks();
+        const preferred = new URL(window.location.href).searchParams.get("tz") || cookie.get("tz") || browserZone;
+        try {
+            const option = aliases.get(canonical(preferred));
+            if (option && option.value !== this.selectedTimezone) {
+                await this._applySelectionChange({timezone: option.value, combinationId: this.selectedCombinationId});
+            }
+        } catch (_error) {
+            // Invalid/stale preferences leave the validated server default intact.
+        }
+        this.timezoneSelect.dataset.ready = "true";
+    },
+
+    _syncTimezone() {
+        this.timezoneSelect.value = this.selectedTimezone;
+        this.el.querySelector(".o_wab_tz_detected").classList.toggle(
+            "d-none", this.selectedTimezone !== this.detectedTimezone
+        );
     },
 
     _setSlotData(slotData, timezone, combinationId = "") {
@@ -97,7 +171,7 @@ publicWidget.registry.WebsiteAppointmentBooking = publicWidget.Widget.extend({
             this.slotsTitle.textContent = "";
         }
         if (this.slotsEmpty) {
-            this.slotsEmpty.classList.remove("d-none");
+            this.slotsEmpty.classList.toggle("d-none", !this.allSlots.length);
         }
         if (this.form) {
             this.form.classList.add("d-none");
@@ -111,6 +185,8 @@ publicWidget.registry.WebsiteAppointmentBooking = publicWidget.Widget.extend({
     },
 
     _refreshAvailableDays() {
+        this.el.querySelector(".o_wab_table").classList.toggle("d-none", !this.allSlots.length);
+        this.el.querySelector(".o_wab_empty_month").classList.toggle("d-none", Boolean(this.allSlots.length));
         this.el.querySelectorAll(".o_wab_day").forEach((dayEl) => {
             const date = dayEl.dataset.date;
             if (!date) {
@@ -228,6 +304,9 @@ publicWidget.registry.WebsiteAppointmentBooking = publicWidget.Widget.extend({
      * @param {Event} ev
      */
     _onDayClick(ev) {
+        if (this.el.getAttribute("aria-busy") === "true") {
+            return;
+        }
         this._showDateSlots(ev.currentTarget.dataset.date, {
             dayEl: ev.currentTarget,
             scroll: true,
@@ -261,8 +340,17 @@ publicWidget.registry.WebsiteAppointmentBooking = publicWidget.Widget.extend({
         }
     },
 
-    async _applySelectionChange({timezone, combinationId, fallbackUrl}) {
+    async _applySelectionChange({timezone, combinationId}) {
+        if (this.el.getAttribute("aria-busy") === "true") {
+            return;
+        }
         const selectedDate = this._getSelectedDate();
+        const note = this.el.querySelector(".o_wab_tz_note");
+        note.textContent = _t("Updating available times…");
+        this.el.setAttribute("aria-busy", "true");
+        this.timezoneSelect.disabled = true;
+        this._syncCombinationButtons(true);
+        this._resetSelection();
         try {
             const data = await this._fetchSlotData(timezone, combinationId);
             this._setSlotData(
@@ -288,8 +376,15 @@ publicWidget.registry.WebsiteAppointmentBooking = publicWidget.Widget.extend({
                 url.searchParams.delete("combination_id");
             }
             window.history.replaceState({}, "", url.toString());
+            cookie.set("tz", this.selectedTimezone);
+            note.textContent = _t("Displayed times update for the selected timezone.");
         } catch (_error) {
-            window.location.assign(fallbackUrl);
+            note.textContent = _t("Could not update times. Please try again.");
+        } finally {
+            this._syncTimezone();
+            this.timezoneSelect.disabled = false;
+            this._syncCombinationButtons(false);
+            this.el.setAttribute("aria-busy", "false");
         }
     },
 
@@ -303,21 +398,7 @@ publicWidget.registry.WebsiteAppointmentBooking = publicWidget.Widget.extend({
         if (!timezone || timezone === this.selectedTimezone) {
             return;
         }
-        const combinationId = this.selectedCombinationId;
-        ev.currentTarget.disabled = true;
-        try {
-            await this._applySelectionChange({
-                timezone,
-                combinationId,
-                fallbackUrl:
-                    `${window.location.pathname}?tz=${encodeURIComponent(timezone)}` +
-                    (combinationId
-                        ? `&combination_id=${encodeURIComponent(combinationId)}`
-                        : ""),
-            });
-        } finally {
-            ev.currentTarget.disabled = false;
-        }
+        await this._applySelectionChange({timezone, combinationId: this.selectedCombinationId});
     },
 
     /**
@@ -330,19 +411,6 @@ publicWidget.registry.WebsiteAppointmentBooking = publicWidget.Widget.extend({
         if (combinationId === this.selectedCombinationId) {
             return;
         }
-        this._syncCombinationButtons(true);
-        try {
-            await this._applySelectionChange({
-                timezone: this.selectedTimezone,
-                combinationId,
-                fallbackUrl:
-                    `${window.location.pathname}?tz=${encodeURIComponent(this.selectedTimezone)}` +
-                    (combinationId
-                        ? `&combination_id=${encodeURIComponent(combinationId)}`
-                        : ""),
-            });
-        } finally {
-            this._syncCombinationButtons(false);
-        }
+        await this._applySelectionChange({timezone: this.selectedTimezone, combinationId});
     },
 });

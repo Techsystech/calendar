@@ -3,6 +3,7 @@
 
 import json
 import time
+from datetime import datetime
 from urllib.parse import urlencode
 
 import pytz
@@ -77,6 +78,30 @@ class WebsiteAppointmentBooking(http.Controller):
     def _get_timezone_options(self):
         """Return timezone options using the standard partner helper."""
         return _tz_get(request.env["res.partner"])
+
+    def _get_timezone_groups(self, start):
+        """Collapse cities only when their remaining known offset rules agree."""
+        start = datetime.combine(start, datetime.min.time())
+        groups, result = {}, {}
+        for name, _label in self._get_timezone_options():
+            zone = pytz.timezone(name)
+            offset = start.replace(tzinfo=pytz.UTC).astimezone(zone).utcoffset()
+            initial_offset = offset
+            transitions = []
+            changes_this_month = False
+            # ponytail: grouping follows pytz's finite transition table; revisit if
+            # booking beyond its known rules is needed. Slot conversion stays native.
+            for when, info in zip(
+                getattr(zone, "_utc_transition_times", ()),
+                getattr(zone, "_transition_info", ()),
+            ):
+                if when > start and info[0] != offset:
+                    transitions.append((when, info[0]))
+                    offset = info[0]
+                    changes_this_month |= (when.year, when.month) == (start.year, start.month)
+            key = (initial_offset, tuple(transitions))
+            result[name] = (groups.setdefault(key, len(groups)), changes_this_month)
+        return result
 
     def _get_selected_tz(self, booking_type, tz_name=None):
         """Return a validated timezone for public slot rendering."""
@@ -255,6 +280,7 @@ class WebsiteAppointmentBooking(http.Controller):
             "selected_tz": slot_payload["selected_tz"],
             "selected_combination_id": slot_payload["selected_combination_id"],
             "timezone_options": self._get_timezone_options(),
+            "timezone_groups": self._get_timezone_groups(slot_payload["calendar_ctx"]["start"]),
             "selection_query": slot_payload["selection_query"],
             "error": error,
         }
