@@ -73,23 +73,19 @@ publicWidget.registry.WebsiteAppointmentBooking = publicWidget.Widget.extend({
         const rank = option => option.selected ? -3 : canonical(option.value) === browserZone ? -2 :
             common.includes(option.value) ? -1 : 0;
         const options = [...this.timezoneSelect.options].sort((a, b) => rank(a) - rank(b));
-        const reference = new Date(Date.UTC(this.displayedYear, this.displayedMonth - 1, 15, 12));
         for (const option of options) {
-            const part = type => {
-                try {
-                    return new Intl.DateTimeFormat(locale, {
-                        timeZone: option.value, timeZoneName: type,
-                    }).formatToParts(reference).find(part => part.type === "timeZoneName").value;
-                } catch (_error) {
-                    return option.value;
-                }
-            };
+            let name = option.value;
+            try {
+                name = new Intl.DateTimeFormat(locale, {
+                    timeZone: option.value, timeZoneName: "longGeneric",
+                }).formatToParts().find(part => part.type === "timeZoneName").value;
+            } catch (_error) {
+                // Keep the server ID if this browser doesn't recognize the zone.
+            }
             // Same name/offset today isn't enough: retain distinct future DST rules.
-            const key = `${part("longGeneric")}/${option.dataset.tzGroup}`;
+            const key = `${name}/${option.dataset.tzGroup}`;
             if (!zones.has(key)) {
-                option.textContent = option.dataset.tzChanges === "1"
-                    ? `${part("longGeneric")} (${_t("UTC offset varies this month")})`
-                    : `${part("long")} (${part("longOffset").replace("GMT", "UTC")})`;
+                option.textContent = name;
                 zones.set(key, option);
             }
             aliases.set(canonical(option.value), zones.get(key));

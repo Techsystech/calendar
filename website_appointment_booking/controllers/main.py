@@ -88,7 +88,6 @@ class WebsiteAppointmentBooking(http.Controller):
             offset = start.replace(tzinfo=pytz.UTC).astimezone(zone).utcoffset()
             initial_offset = offset
             transitions = []
-            changes_this_month = False
             # ponytail: grouping follows pytz's finite transition table; revisit if
             # booking beyond its known rules is needed. Slot conversion stays native.
             for when, info in zip(
@@ -98,9 +97,8 @@ class WebsiteAppointmentBooking(http.Controller):
                 if when > start and info[0] != offset:
                     transitions.append((when, info[0]))
                     offset = info[0]
-                    changes_this_month |= (when.year, when.month) == (start.year, start.month)
             key = (initial_offset, tuple(transitions))
-            result[name] = (groups.setdefault(key, len(groups)), changes_this_month)
+            result[name] = groups.setdefault(key, len(groups))
         return result
 
     def _get_selected_tz(self, booking_type, tz_name=None):
